@@ -1,0 +1,720 @@
+# data_driven_telescoping_all_in_one.py
+# Single-file reproducibility script for:
+#  - Synthetic linear system (telescoping decay slope)
+#  - Noisy data sweep
+#  - 2D advection–diffusion (periodic) reduced surrogate
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import time
+from dataclasses import dataclass
+from typing import Dict, Any, List, Tuple, Optional
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
+
+# --------------------------
+# Utilities
+# --------------------------
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def save_json(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+
+
+def loglog_slope(xs: List[float], ys: List[float]) -> Tuple[float, float]:
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    ys = np.maximum(ys, 1e-300)
+    X = np.log(xs)
+    Y = np.log(ys)
+    A = np.vstack([X, np.ones_like(X)]).T
+    m, b = np.linalg.lstsq(A, Y, rcond=None)[0]
+    return float(m), float(b)
+
+
+def pick_device(device_str: str) -> torch.device:
+    if device_str == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+# --------------------------
+# Telescoping approximant
+# --------------------------
+
+def E_plus(z: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """
+    E_n^(+)(z) = sum_{j=0}^k z^j/j! * (1 - 1/n)^(n-j)
+
+    z: tensor (can be real), shape (...,)
+    returns same shape.
+    """
+    base = 1.0 - 1.0 / float(n)
+    terms = []
+    for j in range(k + 1):
+        # j! via gamma
+        j_fact = torch.lgamma(torch.tensor(float(j + 1), device=z.device)).exp()
+        coef = (z ** j) / j_fact
+        pow_term = base ** (n - j)
+        terms.append(coef * pow_term)
+    return torch.stack(terms, dim=0).sum(dim=0)
+
+
+# --------------------------
+# DMD initialization
+# --------------------------
+
+def dmd_init(U0: torch.Tensor, U1: torch.Tensor, rank_M: int, dt: float
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Basic DMD init from snapshot matrices:
+      U0: (d, N)
+      U1: (d, N)
+
+    Returns:
+      lambdas: (M,) (continuous-time eigenvalues)
+      alphas:  (M,) amplitudes
+      V: (d, M) modes
+      W: (d, M) left modes (approx)
+    """
+    # SVD
+    U, S, VT = torch.linalg.svd(U0, full_matrices=False)
+    U_r = U[:, :rank_M]
+    S_r = S[:rank_M]
+    VT_r = VT[:rank_M, :]
+
+    A_tilde = U_r.T @ U1 @ VT_r.T @ torch.diag(1.0 / (S_r + 1e-12))
+    eigvals, eigvecs = torch.linalg.eig(A_tilde)
+
+    lambdas = torch.log(eigvals) / dt  # continuous-time
+
+    Phi = U1 @ VT_r.T @ torch.diag(1.0 / (S_r + 1e-12)) @ eigvecs
+
+    Phi_pinv = torch.linalg.pinv(Phi)
+    W = Phi_pinv.T
+
+    b = torch.linalg.lstsq(Phi, U0[:, 0]).solution
+    alphas = b
+
+    # Return real parts (the script focuses on stable real systems)
+    return lambdas.real, alphas.real, Phi.real, W.real
+
+
+# --------------------------
+# Exponential-sum kernel model
+# --------------------------
+
+@dataclass
+class KernelParams:
+    lambdas: torch.Tensor  # (M,)
+    alphas: torch.Tensor   # (M,)
+    V: torch.Tensor        # (d, M)
+    W: torch.Tensor        # (d, M)
+
+
+class ExponentialKernelModel(torch.nn.Module):
+    """
+    K_M(t) u = sum_{m=1}^M alpha_m * exp(lambda_m t) * v_m * <w_m, u>
+    """
+    def __init__(self, params: KernelParams):
+        super().__init__()
+        self.lambdas = torch.nn.Parameter(params.lambdas.clone())
+        self.alphas = torch.nn.Parameter(params.alphas.clone())
+        self.V = torch.nn.Parameter(params.V.clone())
+        self.W = torch.nn.Parameter(params.W.clone())
+
+    def forward_K(self, t: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        wTu = (self.W.T @ u)  # (M,)
+        e = torch.exp(self.lambdas * t)
+        coeff = self.alphas * e * wTu
+        return self.V @ coeff
+
+    def forward_Mn(self, t: torch.Tensor, u: torch.Tensor, n: int, k: int) -> torch.Tensor:
+        wTu = (self.W.T @ u)
+        z = self.lambdas * t
+        En = E_plus(z, n=n, k=k)
+        coeff = self.alphas * En * wTu
+        return self.V @ coeff
+
+
+# --------------------------
+# Training
+# --------------------------
+
+@dataclass
+class TrainConfig:
+    epochs: int = 500
+    lr: float = 1e-3
+    lambda_alpha_l1: float = 1e-4
+    lambda_lambda_l2: float = 1e-3
+    C_alpha: float = 5.0
+    C_lambda: float = 5.0
+
+
+def project_bounded(model: ExponentialKernelModel, C_alpha: float, C_lambda: float) -> None:
+    with torch.no_grad():
+        model.alphas.clamp_(-C_alpha, C_alpha)
+        model.lambdas.clamp_(-C_lambda, C_lambda)
+
+
+def fit_kernel_model(
+    model: ExponentialKernelModel,
+    data_u0: torch.Tensor,   # (Ntraj, d)
+    data_ut: torch.Tensor,   # (Ntraj, Nt, d)
+    times: torch.Tensor,     # (Nt,)
+    cfg: TrainConfig,
+    device: torch.device,
+) -> Dict[str, Any]:
+    model.to(device)
+    data_u0 = data_u0.to(device)
+    data_ut = data_ut.to(device)
+    times = times.to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    history = {"loss": []}
+
+    it = range(cfg.epochs)
+    if tqdm is not None:
+        it = tqdm(it, desc="training", leave=False)
+
+    Ntraj, Nt, d = data_ut.shape
+
+    for _ in it:
+        opt.zero_grad(set_to_none=True)
+
+        loss = torch.zeros((), device=device)
+        for i in range(Ntraj):
+            u0 = data_u0[i]
+            for j in range(Nt):
+                t = times[j]
+                pred = model.forward_K(t, u0)
+                loss = loss + torch.mean((pred - data_ut[i, j]) ** 2)
+
+        loss = loss / (Ntraj * Nt)
+        reg = cfg.lambda_alpha_l1 * torch.sum(torch.abs(model.alphas))
+        reg = reg + cfg.lambda_lambda_l2 * torch.sum(torch.abs(model.lambdas) ** 2)
+        total = loss + reg
+
+        total.backward()
+        opt.step()
+        project_bounded(model, cfg.C_alpha, cfg.C_lambda)
+
+        history["loss"].append(float(total.detach().cpu()))
+
+    return history
+
+
+# --------------------------
+# Linear system data
+# --------------------------
+
+def make_stable_matrix(d: int, eig_min: float, eig_max: float, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    Q, _ = np.linalg.qr(rng.standard_normal((d, d)))
+    eigs = rng.uniform(eig_min, eig_max, size=d)
+    A = Q @ np.diag(eigs) @ Q.T
+    return A
+
+
+def expm_action_via_eig(A: np.ndarray, t: float, u: np.ndarray) -> np.ndarray:
+    w, V = np.linalg.eig(A)
+    Vinv = np.linalg.inv(V)
+    return (V @ np.diag(np.exp(w * t)) @ Vinv @ u).real
+
+
+def generate_linear_dataset(
+    d: int,
+    eig_min: float,
+    eig_max: float,
+    n_traj: int,
+    n_time: int,
+    t_max: float,
+    seed: int,
+    noise_sigma: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns A, times, U0 (n_traj,d), Ut (n_traj,n_time,d)
+    """
+    A = make_stable_matrix(d, eig_min, eig_max, seed=seed)
+    times = np.linspace(0.0, t_max, n_time)
+    rng = np.random.default_rng(seed + 1)
+    U0 = rng.normal(size=(n_traj, d)).astype(np.float64)
+    Ut = np.zeros((n_traj, n_time, d), dtype=np.float64)
+
+    for i in range(n_traj):
+        for j, t in enumerate(times):
+            Ut[i, j] = expm_action_via_eig(A, t, U0[i])
+
+    if noise_sigma > 0:
+        Ut = Ut + rng.normal(scale=noise_sigma, size=Ut.shape)
+
+    return A, times, U0, Ut
+
+
+# --------------------------
+# PDE: advection–diffusion (periodic) data
+# --------------------------
+
+def laplacian_periodic(u: np.ndarray, nx: int, ny: int, dx: float, dy: float) -> np.ndarray:
+    U = u.reshape(ny, nx)
+    up = np.roll(U, -1, axis=0)
+    um = np.roll(U, 1, axis=0)
+    vp = np.roll(U, -1, axis=1)
+    vm = np.roll(U, 1, axis=1)
+    return ((up - 2*U + um) / (dy*dy) + (vp - 2*U + vm) / (dx*dx)).reshape(-1)
+
+
+def grad_periodic(u: np.ndarray, nx: int, ny: int, dx: float, dy: float) -> Tuple[np.ndarray, np.ndarray]:
+    U = u.reshape(ny, nx)
+    du_dx = (np.roll(U, -1, axis=1) - np.roll(U, 1, axis=1)) / (2*dx)
+    du_dy = (np.roll(U, -1, axis=0) - np.roll(U, 1, axis=0)) / (2*dy)
+    return du_dx.reshape(-1), du_dy.reshape(-1)
+
+
+def step_euler_advec_diff(u: np.ndarray, nx: int, ny: int, nu: float, c1: float, c2: float, dt: float) -> np.ndarray:
+    dx = 1.0 / nx
+    dy = 1.0 / ny
+    lap = laplacian_periodic(u, nx, ny, dx, dy)
+    ux, uy = grad_periodic(u, nx, ny, dx, dy)
+    return u + dt * (nu * lap - (c1 * ux + c2 * uy))
+
+
+def random_bumps(nx: int, ny: int, n_peaks: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0, 1, nx, endpoint=False)
+    y = np.linspace(0, 1, ny, endpoint=False)
+    X, Y = np.meshgrid(x, y)
+    u = np.zeros((ny, nx), dtype=float)
+    for _ in range(n_peaks):
+        cx, cy = rng.random(), rng.random()
+        amp = rng.normal()
+        width = 0.02 + 0.05 * rng.random()
+        u += amp * np.exp(-((X-cx)**2 + (Y-cy)**2) / (2*width**2))
+    return u.reshape(-1)
+
+
+def generate_pde_dataset(
+    nx: int,
+    ny: int,
+    nu: float,
+    c1: float,
+    c2: float,
+    dt: float,
+    t_train_max: float,
+    n_time_samples: int,
+    n_traj: int,
+    seed: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns times, U0 (n_traj,d), Ut (n_traj,n_time,d)
+    """
+    d = nx * ny
+    times = np.linspace(0.0, t_train_max, n_time_samples)
+    steps_per_sample = max(1, int(round(times[1] / dt)))
+
+    U0 = np.zeros((n_traj, d), dtype=np.float64)
+    Ut = np.zeros((n_traj, n_time_samples, d), dtype=np.float64)
+
+    for i in range(n_traj):
+        u = random_bumps(nx, ny, n_peaks=8, seed=seed + 1000 + i).astype(np.float64)
+        U0[i] = u.copy()
+        Ut[i, 0] = u.copy()
+
+        cur_t = 0.0
+        for j in range(1, n_time_samples):
+            # integrate forward for steps_per_sample Euler steps
+            for _ in range(steps_per_sample):
+                u = step_euler_advec_diff(u, nx, ny, nu, c1, c2, dt)
+                cur_t += dt
+            Ut[i, j] = u.copy()
+
+    return times, U0, Ut
+
+
+# --------------------------
+# Experiments
+# --------------------------
+
+def run_linear(args) -> None:
+    device = pick_device(args.device)
+    set_seed(args.seed)
+
+    out_dir = os.path.join(args.save_dir, "linear")
+    ensure_dir(out_dir)
+
+    A, times, U0, Ut = generate_linear_dataset(
+        d=args.dim,
+        eig_min=args.eig_min,
+        eig_max=args.eig_max,
+        n_traj=args.n_traj,
+        n_time=args.n_time,
+        t_max=args.t_train_max,
+        seed=args.seed,
+        noise_sigma=0.0,
+    )
+
+    # DMD init from first time-step
+    dt = float(times[1] - times[0])
+    U0_mat = torch.tensor(U0.T, dtype=torch.float32)
+    U1_mat = torch.tensor(Ut[:, 1, :].T, dtype=torch.float32)
+    lambdas, alphas, V, W = dmd_init(U0_mat, U1_mat, rank_M=args.rank_M, dt=dt)
+
+    model = ExponentialKernelModel(KernelParams(lambdas=lambdas, alphas=alphas, V=V, W=W))
+
+    history = fit_kernel_model(
+        model,
+        data_u0=torch.tensor(U0, dtype=torch.float32),
+        data_ut=torch.tensor(Ut, dtype=torch.float32),
+        times=torch.tensor(times, dtype=torch.float32),
+        cfg=TrainConfig(
+            epochs=args.epochs,
+            lr=args.lr,
+            lambda_alpha_l1=args.lambda_alpha_l1,
+            lambda_lambda_l2=args.lambda_lambda_l2,
+            C_alpha=args.C_alpha,
+            C_lambda=args.C_lambda,
+        ),
+        device=device
+    )
+
+    # Telescoping increment norms
+    levels = [1, 2, 5, 10, 20] if args.levels is None else [int(x) for x in args.levels]
+    k = args.k
+    u0 = torch.tensor(U0[0], dtype=torch.float32, device=device)
+    t = torch.tensor(float(args.t_train_max), dtype=torch.float32, device=device)
+
+    incr_norms = []
+    with torch.no_grad():
+        for n in levels:
+            Mn = model.forward_Mn(t, u0, n=n, k=k)
+            Mnp1 = model.forward_Mn(t, u0, n=n+1, k=k)
+            incr_norms.append(float(torch.norm(Mnp1 - Mn).cpu()))
+
+    slope, _ = loglog_slope(levels[1:], incr_norms[1:])  # ignore n=1
+    theory = -(k + 1)
+
+    # Plot
+    plt.figure()
+    plt.loglog(levels, incr_norms, marker="o")
+    plt.xlabel("refinement level n")
+    plt.ylabel("||M_{n+1} - M_n||")
+    plt.title(f"Telescoping decay slope: {slope:.2f} (theory {theory})")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "telescoping_decay.png"), dpi=200)
+
+    save_json(os.path.join(out_dir, "metrics.json"), {
+        "mode": "linear",
+        "seed": args.seed,
+        "dim": args.dim,
+        "rank_M": args.rank_M,
+        "k": k,
+        "levels": levels,
+        "increment_norms": incr_norms,
+        "measured_slope": slope,
+        "theory_slope": theory,
+        "final_train_loss": history["loss"][-1] if history["loss"] else None,
+        "device": str(device),
+    })
+
+    print(f"[linear] saved to {out_dir} | slope={slope:.3f} (theory {theory})")
+
+
+def run_noisy(args) -> None:
+    device = pick_device(args.device)
+    set_seed(args.seed)
+
+    out_dir = os.path.join(args.save_dir, "noisy")
+    ensure_dir(out_dir)
+
+    sigmas = [1e-3, 1e-2, 1e-1] if args.noise_sigmas is None else [float(x) for x in args.noise_sigmas]
+    levels = [1, 2, 5, 10, 20] if args.levels is None else [int(x) for x in args.levels]
+
+    results = []
+    for sigma in sigmas:
+        sub_dir = os.path.join(out_dir, f"sigma_{sigma:g}")
+        ensure_dir(sub_dir)
+
+        A, times, U0, Ut = generate_linear_dataset(
+            d=args.dim,
+            eig_min=args.eig_min,
+            eig_max=args.eig_max,
+            n_traj=args.n_traj,
+            n_time=args.n_time,
+            t_max=args.t_train_max,
+            seed=args.seed,
+            noise_sigma=sigma,
+        )
+
+        dt = float(times[1] - times[0])
+        U0_mat = torch.tensor(U0.T, dtype=torch.float32)
+        U1_mat = torch.tensor(Ut[:, 1, :].T, dtype=torch.float32)
+        lambdas, alphas, V, W = dmd_init(U0_mat, U1_mat, rank_M=args.rank_M, dt=dt)
+
+        model = ExponentialKernelModel(KernelParams(lambdas=lambdas, alphas=alphas, V=V, W=W))
+
+        history = fit_kernel_model(
+            model,
+            data_u0=torch.tensor(U0, dtype=torch.float32),
+            data_ut=torch.tensor(Ut, dtype=torch.float32),
+            times=torch.tensor(times, dtype=torch.float32),
+            cfg=TrainConfig(
+                epochs=args.epochs,
+                lr=args.lr,
+                lambda_alpha_l1=args.lambda_alpha_l1,
+                lambda_lambda_l2=args.lambda_lambda_l2,
+                C_alpha=args.C_alpha,
+                C_lambda=args.C_lambda,
+            ),
+            device=device
+        )
+
+        k = args.k
+        u0 = torch.tensor(U0[0], dtype=torch.float32, device=device)
+        t = torch.tensor(float(args.t_train_max), dtype=torch.float32, device=device)
+
+        incr_norms = []
+        with torch.no_grad():
+            for n in levels:
+                Mn = model.forward_Mn(t, u0, n=n, k=k)
+                Mnp1 = model.forward_Mn(t, u0, n=n+1, k=k)
+                incr_norms.append(float(torch.norm(Mnp1 - Mn).cpu()))
+
+        slope, _ = loglog_slope(levels[1:], incr_norms[1:])
+        theory = -(k + 1)
+
+        plt.figure()
+        plt.loglog(levels, incr_norms, marker="o")
+        plt.xlabel("refinement level n")
+        plt.ylabel("||M_{n+1} - M_n||")
+        plt.title(f"sigma={sigma:g} slope={slope:.2f} (theory {theory})")
+        plt.tight_layout()
+        plt.savefig(os.path.join(sub_dir, "telescoping_decay.png"), dpi=200)
+
+        payload = {
+            "sigma": sigma,
+            "levels": levels,
+            "increment_norms": incr_norms,
+            "measured_slope": slope,
+            "theory_slope": theory,
+            "final_train_loss": history["loss"][-1] if history["loss"] else None,
+        }
+        save_json(os.path.join(sub_dir, "metrics.json"), payload)
+        results.append(payload)
+
+        print(f"[noisy] sigma={sigma:g} | slope={slope:.3f}")
+
+    save_json(os.path.join(out_dir, "summary.json"), {
+        "mode": "noisy",
+        "seed": args.seed,
+        "sigmas": sigmas,
+        "rank_M": args.rank_M,
+        "k": args.k,
+        "results": results,
+        "device": str(device),
+    })
+
+    print(f"[noisy] saved summary to {out_dir}")
+
+
+def run_pde(args) -> None:
+    device = pick_device(args.device)
+    set_seed(args.seed)
+
+    out_dir = os.path.join(args.save_dir, "pde")
+    ensure_dir(out_dir)
+
+    times, U0, Ut = generate_pde_dataset(
+        nx=args.nx, ny=args.ny,
+        nu=args.nu,
+        c1=args.c1, c2=args.c2,
+        dt=args.dt,
+        t_train_max=args.t_train_max,
+        n_time_samples=args.n_time,
+        n_traj=args.n_traj,
+        seed=args.seed
+    )
+
+    # DMD init using t0->t1 snapshots across trajectories
+    dt_sample = float(times[1] - times[0])
+    U0_mat = torch.tensor(U0.T, dtype=torch.float32)
+    U1_mat = torch.tensor(Ut[:, 1, :].T, dtype=torch.float32)
+    lambdas, alphas, V, W = dmd_init(U0_mat, U1_mat, rank_M=args.rank_M, dt=dt_sample)
+
+    model = ExponentialKernelModel(KernelParams(lambdas=lambdas, alphas=alphas, V=V, W=W))
+
+    history = fit_kernel_model(
+        model,
+        data_u0=torch.tensor(U0, dtype=torch.float32),
+        data_ut=torch.tensor(Ut, dtype=torch.float32),
+        times=torch.tensor(times, dtype=torch.float32),
+        cfg=TrainConfig(
+            epochs=args.epochs,
+            lr=args.lr,
+            lambda_alpha_l1=args.lambda_alpha_l1,
+            lambda_lambda_l2=args.lambda_lambda_l2,
+            C_alpha=args.C_alpha,
+            C_lambda=args.C_lambda,
+        ),
+        device=device
+    )
+
+    # Evaluate error vs refinement n on held-out trajectories (use last 10 as test)
+    k = args.k
+    levels = [1, 2, 5, 10] if args.levels is None else [int(x) for x in args.levels]
+    N = U0.shape[0]
+    test_idx = list(range(max(0, N - min(10, N)), N))
+    t_eval = float(times[-1])
+
+    rel_errors = []
+    incr_norms = []
+
+    with torch.no_grad():
+        for n in levels:
+            errs = []
+            incs = []
+            for i in test_idx:
+                u0 = torch.tensor(U0[i], dtype=torch.float32, device=device)
+                true = torch.tensor(Ut[i, -1], dtype=torch.float32, device=device)
+
+                pred_n = model.forward_Mn(torch.tensor(t_eval, device=device), u0, n=n, k=k)
+                pred_np1 = model.forward_Mn(torch.tensor(t_eval, device=device), u0, n=n+1, k=k)
+
+                err = torch.norm(true - pred_n) / (torch.norm(true) + 1e-12)
+                inc = torch.norm(pred_np1 - pred_n)
+
+                errs.append(float(err.cpu()))
+                incs.append(float(inc.cpu()))
+
+            rel_errors.append(float(np.mean(errs)))
+            incr_norms.append(float(np.mean(incs)))
+
+    slope, _ = loglog_slope(levels[1:], incr_norms[1:])
+    theory = -(k + 1)
+
+    # Plot refinement vs incremental decay
+    plt.figure()
+    plt.loglog(levels, incr_norms, marker="o")
+    plt.xlabel("refinement level n")
+    plt.ylabel("mean ||M_{n+1} - M_n||")
+    plt.title(f"PDE telescoping decay slope: {slope:.2f} (theory {theory})")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "telescoping_decay.png"), dpi=200)
+
+    # Plot refinement vs relative error
+    plt.figure()
+    plt.loglog(levels, rel_errors, marker="o")
+    plt.xlabel("refinement level n")
+    plt.ylabel("mean relative L2 error")
+    plt.title("PDE prediction error vs refinement")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "error_vs_n.png"), dpi=200)
+
+    save_json(os.path.join(out_dir, "metrics.json"), {
+        "mode": "pde",
+        "seed": args.seed,
+        "nx": args.nx,
+        "ny": args.ny,
+        "nu": args.nu,
+        "c1": args.c1,
+        "c2": args.c2,
+        "rank_M": args.rank_M,
+        "k": k,
+        "t_eval": t_eval,
+        "levels": levels,
+        "mean_increment_norms": incr_norms,
+        "mean_rel_errors": rel_errors,
+        "measured_slope": slope,
+        "theory_slope": theory,
+        "final_train_loss": history["loss"][-1] if history["loss"] else None,
+        "device": str(device),
+    })
+
+    print(f"[pde] saved to {out_dir} | slope={slope:.3f} (theory {theory})")
+
+
+# --------------------------
+# CLI
+# --------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["linear", "noisy", "pde"], required=True)
+    p.add_argument("--save_dir", default="results")
+    p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    p.add_argument("--seed", type=int, default=123)
+
+    # shared model/training
+    p.add_argument("--rank_M", type=int, default=10)
+    p.add_argument("--k", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=500)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lambda_alpha_l1", type=float, default=1e-4)
+    p.add_argument("--lambda_lambda_l2", type=float, default=1e-3)
+    p.add_argument("--C_alpha", type=float, default=5.0)
+    p.add_argument("--C_lambda", type=float, default=5.0)
+
+    # refinement levels
+    p.add_argument("--levels", nargs="*", default=None, help="e.g. --levels 1 2 5 10 20")
+
+    # linear/noisy params
+    p.add_argument("--dim", type=int, default=50)
+    p.add_argument("--eig_min", type=float, default=-1.0)
+    p.add_argument("--eig_max", type=float, default=0.0)
+    p.add_argument("--n_traj", type=int, default=100)
+    p.add_argument("--n_time", type=int, default=50)
+    p.add_argument("--t_train_max", type=float, default=5.0)
+
+    # noisy sweep
+    p.add_argument("--noise_sigmas", nargs="*", default=None, help="e.g. --noise_sigmas 1e-3 1e-2 1e-1")
+
+    # PDE params
+    p.add_argument("--nx", type=int, default=64)
+    p.add_argument("--ny", type=int, default=64)
+    p.add_argument("--nu", type=float, default=0.01)
+    p.add_argument("--c1", type=float, default=1.0)
+    p.add_argument("--c2", type=float, default=0.5)
+    p.add_argument("--dt", type=float, default=1e-3)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    ensure_dir(args.save_dir)
+
+    if args.mode == "linear":
+        run_linear(args)
+    elif args.mode == "noisy":
+        run_noisy(args)
+    elif args.mode == "pde":
+        run_pde(args)
+    else:
+        raise ValueError("Unknown mode")
+
+
+if __name__ == "__main__":
+    main()
